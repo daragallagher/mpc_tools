@@ -1,0 +1,4 @@
+# The MPC checks apcMiniMk2.ini's checksum against the exact bytes of apcMiniMk2.lua: never
+# convert their line endings.
+*.lua -text
+*.ini -text

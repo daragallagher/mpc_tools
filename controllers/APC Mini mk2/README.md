@@ -9,11 +9,12 @@ Nothing on the MPC is patched or modified.
 
 ## Requirements
 
-- An MPC standalone running **MPC OS 3.10.1**. Tested on an MPC One+ Pro. Other Gen2 MPCs on
-  3.10.1 should work but haven't been tested, and other MPC OS versions may not load the script.
+- An MPC running **MPC OS 3.10.1**. Personally tested on an MPC One+ Pro. Other
+  Gen2 MPCs on 3.10.1 should work.  It's been reported to me that it also works
+  on Gen1 hardware - specifically an MPC Live.
 - The **clip workflow** (the clip matrix), which needs the **MPC 3 Pro Pack**.
 - An **APC mini mk2** (not the original APC mini), plugged into the MPC's USB host port.
-- A computer on the same network as the MPC, with `ssh` and `scp`
+- A computer on the same network as the MPC, with `ssh` and `scp`.
 
 ## Install
 
@@ -37,13 +38,16 @@ Nothing on the MPC is patched or modified.
    ```
 
    The files must end up in `MPC Documents/Devices/APC mini mk2/`.
-4. **Restart the MPC.** Scripts are loaded when the MPC starts.
-5. **Plug in the APC.** All pads light white for a second, then show the clip matrix.
+4. **Restart the MPC.** Scripts are loaded when the MPC starts.  You may want to turn off
+   the developer enhancement at this point also as it provides root access from your network
+   to anyone who knows the MPC's IP address.
+5. **Plug in the APC.** All pads should light white for a second, then show the clip matrix.
 
 ## Controls
 
-The 8x8 pads are a window onto the MPC's clip matrix, which can be larger. Each pad is one clip
-slot, each row one scene, and each column one track.
+The 8x8 pads are a window onto the MPC's clip matrix, but the matrix can be larger (in which
+case use shift with the arrow buttons to move the 8x8 window). Each pad is one clip slot, each
+row one scene, and each column one track.
 
 | Control | Press | With Shift held |
 |---|---|---|
@@ -57,8 +61,8 @@ slot, each row one scene, and each column one track.
 - **Moving around:** Shift + the arrow buttons. The APC's window moves on its own; scrolling the
   clip matrix on the MPC's screen doesn't move it.
 - The labels printed on the track buttons (volume, pan, send, device) and on scene buttons 1-5
-  (clip stop, solo, mute, rec arm, select) are for Ableton Live and aren't used. The master
-  fader isn't used.
+  (clip stop, solo, mute, rec arm, select) aren't currently used. Neither is the master fader.
+  Suggestions welcome.
 
 ## Lights
 
@@ -82,12 +86,13 @@ slot, each row one scene, and each column one track.
 
 - **Nothing lights up when the APC is plugged in.** Check that both files are in
   `MPC Documents/Devices/APC mini mk2/`, that they haven't been edited, and that the MPC was
-  restarted after copying. Check the MPC OS version (Requirements).
+  restarted after copying.
 - **All pads are red.** The script is running, but the clip workflow isn't available: it needs
   the MPC 3 Pro Pack.
 - **The pads went dark and don't launch clips.** Shift + *drum* or Shift + *note* (scene buttons
-  6 and 7) switch the APC into its own drum or note mode. Press the same combination again to
-  return; the pads light up again when you let go of Shift.
+  6 and 7) switch the APC mini into its own drum or note mode.  You cannot interact with the
+  MPC's clip matrix from these modes. Press the same combination again to exit out of these
+  modes; the pads should light up again when back in "default" mode.
 - **Logs**, for the curious: with SSH on, `ssh root@<ip> journalctl -u acvs | grep apcMiniMk2`.
   A normal start shows `script file loaded` and `ready`.
 
@@ -95,8 +100,8 @@ slot, each row one scene, and each column one track.
 
 The MPC only loads a script if its `.ini` contains the right checksum: a hash of the `.lua`
 file combined with a value hidden in the MPC's firmware. Any change to `apcMiniMk2.lua`, even
-to a comment, needs a new checksum in `apcMiniMk2.ini`. I haven't included a tool to compute
-it, because I'm not sure about the legality of publishing one.
+to a comment, needs a new checksum in `apcMiniMk2.ini`. `tools/sign_scripts.py` recomputes it
+from a stock firmware image you supply; see [tools/README.md](../../tools/README.md).
 
 ## Uninstall
 
