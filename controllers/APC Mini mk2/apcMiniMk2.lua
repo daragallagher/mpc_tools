@@ -13,11 +13,20 @@
 --   track buttons 1-8 notes 100-107, under columns 1-8                -> select that track; the
 --                     current track's button is lit
 --   shift             note 122
+--     shift + track 1-4 (Volume/Pan/Send/Device)                      -> fader mode (send again
+--                                                                        cycles Send 1-4)
 --     shift + track 5-8 (the arrows)                                  -> move the window by 1
+--     shift + scene 1-5 (Clip Stop/Solo/Mute/Rec Arm/Select)          -> track-button mode: the 8
+--                                                                        bottom buttons then do
+--                                                                        stop-clips/solo/mute/arm/
+--                                                                        select per track (default
+--                                                                        Select); mode LED shown on
+--                                                                        the scene column while Shift
 --     shift + scene 8 (stop all clips)                                -> stop all clips
 --     shift + pad                                                     -> select clip, no launch
---   faders 0-7       CC 48-55                                         -> volume of the track in
---                    that column
+--   faders 0-7       CC 48-55                                         -> the fader mode's parameter
+--                    for the track in that column (volume/pan/send/device); default volume
+--   master fader 9   CC 56                                            -> master track volume (always)
 -----------------------------------------------------------------------------------------------
 
 local deviceName = "apcMiniMk2"; -- must match the file name; the MPC exposes the table apcMiniMk2
@@ -25,7 +34,8 @@ local controlPortIndex = 0;      -- order of output= lines in apcMiniMk2.ini
 
 local cols, rows = 8, 8;
 local trackButtonBase, sceneButtonBase, shiftNote = 100, 112, 122;
-local faderCCBase = 48;          -- faders 0-7 = CC 48-55 (master fader CC 56 not mapped)
+local faderCCBase = 48;          -- faders 0-7 = CC 48-55
+local masterFaderCC = 56;        -- the 9th fader (master) = CC 56 -> master track volume
 local SCENE_STOP_ALL = 7;
 
 -- With Shift, the four arrow buttons move the window. Keys are the track-button index (0-7, i.e.
@@ -107,6 +117,22 @@ local introductionSysex = sysexHeader .. string.char(0x60, 0x00, 0x04, 0x00, 0x0
 local shiftHeld = false;
 local loaded = false;    -- from a completed OnLoad set-up until teardown: listeners, mappings, Show
 
+-- Fader mode (like Ableton's Volume/Pan/Send/Device): Shift + track buttons 1-4 choose what
+-- the 8 faders control. Shift+Send again cycles Send 1->2->3->4. The mode persists; it is shown
+-- on the track-button LEDs only while Shift is held (so the normal view keeps current-track).
+local faderMode = "volume";   -- "volume" | "pan" | "send" | "device"
+local sendIndex = 1;          -- which send (1-4) in send mode
+local FADER_MODES = { [0] = "volume", [1] = "pan", [2] = "send", [3] = "device" };
+local FADER_MODE_COLUMN = { volume = 0, pan = 1, send = 2, device = 3 };
+
+-- Track-button mode (like Ableton's APC mini): Shift + a scene button chooses what the 8 bottom
+-- buttons do to each track. Default "select" = the old behaviour (current track lit). The mode
+-- persists; it is shown on the scene-button LEDs only while Shift is held.
+local trackMode = "select";   -- "select" | "clipStop" | "solo" | "mute" | "recArm"
+-- Scene row (Shift + scene) -> mode, matching the APC mini mk2 right-column silkscreen,
+-- top to bottom: Clip Stop, Solo, Mute, Rec Arm, Select. Row 7 stays Stop All Clips.
+local SCENE_MODE = { [0] = "clipStop", [1] = "solo", [2] = "mute", [3] = "recArm", [4] = "select" };
+
 local ledCache = {};     -- note -> last LED command sent (a string key); only changes are sent
 
 -----------------------------------------------------------------------------------------------
@@ -153,6 +179,7 @@ for col = 0, cols - 1 do surfaceNotes[#surfaceNotes + 1] = trackButtonBase + col
 for row = 0, rows - 1 do surfaceNotes[#surfaceNotes + 1] = sceneButtonBase + row; end
 surfaceNotes[#surfaceNotes + 1] = shiftNote;
 for fader = 0, cols - 1 do surfaceCCs[#surfaceCCs + 1] = faderCCBase + fader; end
+surfaceCCs[#surfaceCCs + 1] = masterFaderCC;
 
 local function routeSurface(toScript)
   local script = apcMiniMk2.mappings.script;
@@ -164,6 +191,23 @@ local function routeSurface(toScript)
   end
 end
 local function clip(col, row) return aperture().clipProperties[col][row]; end
+
+-- The global track index and object under window column 0-7, or nil past the last track.
+local function windowTrack(col)
+  local global = aperture().ToGlobalColumn(col);
+  if global == nil or global < 0 or global >= mpc.tracks.normalTracks.Count.value then return nil; end
+  return global, mpc.tracks.normalTracks[global];
+end
+
+-- Boolean view of a track flag (Mute/Solo/RecArm). MPC state properties can be numbers where 0
+-- means off, and Lua treats 0 as true, so the raw value must never be tested directly.
+local function trackFlag(track, name)
+  local p = track and track[name];
+  if p == nil then return false; end
+  local ok, v = pcall(function() return p.value; end);
+  if not ok or v == nil or v == false or v == 0 then return false; end
+  return true;
+end
 
 -----------------------------------------------------------------------------------------------
 -- State -> LED
@@ -219,17 +263,56 @@ local function currentTrackColumn()
   return nil;
 end
 
--- Track button LEDs: the current track's button on, the others off.
+-- Track button LEDs. Normally the current track's button is on, the others off. While Shift is
+-- held the row becomes the fader-mode layer: buttons 1-4 show Volume/Pan/Send/Device with the
+-- active mode lit (buttons 5-8 are the window arrows, momentary, left dark).
+-- Any clip in window column `col` playing, recording or queued (so it can be stopped)?
+local function columnActive(col)
+  for row = 0, rows - 1 do
+    local s = clip(col, row).State.value;
+    if s and s >= S.WillPlay then return true; end
+  end
+  return false;
+end
+
+-- Is window column `col`'s button lit in the active track-button mode?
+local function trackButtonLit(col, current)
+  if trackMode == "select" then return col == current; end
+  if trackMode == "clipStop" then return columnActive(col); end
+  local _, t = windowTrack(col);
+  if not t then return false; end
+  if trackMode == "mute" then return trackFlag(t, "Mute"); end
+  if trackMode == "solo" then return trackFlag(t, "Solo"); end
+  if trackMode == "recArm" then return trackFlag(t, "RecArm"); end
+  return false;
+end
+
+-- Track button LEDs. While Shift is held the row is the fader-mode layer (Volume/Pan/Send/Device,
+-- active lit; 5-8 arrows left dark). Otherwise each button shows its track's state in the active
+-- track-button mode: select = current track, mute/solo/recArm = flagged tracks, clipStop = tracks
+-- with an active clip. The APC's side buttons are single-colour, so the mode says what "lit" means.
 local function updateTrackButtons()
+  if shiftHeld then
+    local activeCol = FADER_MODE_COLUMN[faderMode];
+    for col = 0, cols - 1 do
+      sendLed(trackButtonBase + col, 0, col == activeCol and BTN_ON or BTN_OFF);
+    end
+    return;
+  end
   local current = currentTrackColumn();
   for col = 0, cols - 1 do
-    sendLed(trackButtonBase + col, 0, col == current and BTN_ON or BTN_OFF);
+    sendLed(trackButtonBase + col, 0, trackButtonLit(col, current) and BTN_ON or BTN_OFF);
   end
 end
 
 -- Scene button LED. sceneProperties[row].State uses the clip-state enum, and covers the whole
 -- scene, including tracks outside the 8-column window.
 local function updateSceneButton(row)
+  if shiftHeld then
+    -- Shift layer: the scene column is the track-button mode selector, the active mode lit.
+    sendLed(sceneButtonBase + row, 0, (SCENE_MODE[row] == trackMode) and BTN_ON or BTN_OFF);
+    return;
+  end
   local ok, s = try("sceneProperties.State", function() return aperture().sceneProperties[row].State.value; end);
   local led = BTN_OFF;
   if ok and s then
@@ -237,6 +320,10 @@ local function updateSceneButton(row)
     elseif s == S.Playing then led = BTN_ON; end
   end
   sendLed(sceneButtonBase + row, 0, led);
+end
+
+local function updateSceneButtons()
+  for row = 0, rows - 1 do updateSceneButton(row); end
 end
 
 local function refreshAll()
@@ -263,6 +350,38 @@ local function fillAll(padColour, buttonLed)
   ledCache = {};
 end
 
+-- Mute/Solo/RecArm listeners on the eight tracks under the window, so the track-button LEDs follow
+-- changes made on the MPC itself. Those tracks are global, so these listeners are re-registered
+-- whenever the window moves (unlike the clip listeners, which sit on fixed window-local slots).
+local mixerListened = {};
+local MIX_KEY = deviceName .. "/mix";
+local function clearMixerListeners()
+  for _, t in ipairs(mixerListened) do
+    try("mix:stopListening", function()
+      t.Mute:stopListening(MIX_KEY); t.Solo:stopListening(MIX_KEY); t.RecArm:stopListening(MIX_KEY);
+    end);
+  end
+  mixerListened = {};
+end
+local function registerMixerListeners()
+  clearMixerListeners();
+  for col = 0, cols - 1 do
+    local _, t = windowTrack(col);
+    if t then
+      local function changed() if not shiftHeld then updateTrackButtons(); end end
+      if (try("mix:listen", function()
+        t.Mute:listen(changed, MIX_KEY); t.Solo:listen(changed, MIX_KEY); t.RecArm:listen(changed, MIX_KEY);
+      end)) then mixerListened[#mixerListened + 1] = t; end
+    end
+  end
+end
+
+-- The window moved: the eight window tracks changed, so re-bind the mixer listeners, then repaint.
+local function windowMoved()
+  registerMixerListeners();
+  refreshAll();
+end
+
 -----------------------------------------------------------------------------------------------
 -- Listeners: one per clip property and scene state. Re-registered on load only; moving the
 -- aperture changes which global clips the same local properties refer to.
@@ -272,7 +391,10 @@ local function registerListeners()
   for col = 0, cols - 1 do
     for row = 0, rows - 1 do
       local c = clip(col, row);
-      local function changed() updatePad(col, row); end
+      local function changed()
+        updatePad(col, row);
+        if not shiftHeld and trackMode == "clipStop" then updateTrackButtons(); end
+      end
       c.State:listen(changed, deviceName);
       c.Colour:listen(changed, deviceName);
     end
@@ -288,8 +410,8 @@ local function registerListeners()
   try("currentTrack.Name:listen", function() mpc.tracks.currentTrack.Name:listen(updateTrackButtons, deviceName); end);
   -- UNVERIFIED: OriginX/OriginY as listenable properties. The refresh after each move in page()
   -- covers the case where they are not listenable.
-  try("OriginX:listen", function() aperture().OriginX:listen(refreshAll, deviceName); end);
-  try("OriginY:listen", function() aperture().OriginY:listen(refreshAll, deviceName); end);
+  try("OriginX:listen", function() aperture().OriginX:listen(windowMoved, deviceName); end);
+  try("OriginY:listen", function() aperture().OriginY:listen(windowMoved, deviceName); end);
 end
 
 local function clearListeners()
@@ -321,10 +443,53 @@ local function trackForFader(fader)
   return mpc.tracks.normalTracks[global];
 end
 
--- The fader's position sets the track's volume.
+-- Device mode: a fader drives the current track's Q-Link (plugin parameter) in that slot.
+-- UNVERIFIED on 3.10.1: SetPosition is known to only move the on-screen knob, so this drives the
+-- Q-Link with Touch()+Twist(target-current), the way the community scripts do; may need tuning.
+local function setQlinkFader(fader, value)
+  local cs = mpc.controlSurface;
+  local ql = cs and cs.qlinks;
+  if not ql then return; end
+  local q = ql[fader];
+  if not q then return; end
+  try("qlink touch", function() if q.Touch then q.Touch(); end end);
+  if type(q.Twist) == "function" then
+    for _ = 1, 2 do
+      local pos = 0;
+      pcall(function() pos = q.GetPosition() or 0; end);
+      local delta = value - pos;
+      if delta == 0 then break; end
+      if delta > 127 then delta = 127; elseif delta < -127 then delta = -127; end
+      try("qlink twist", function() q.Twist(delta); end);
+    end
+  elseif type(q.SetValue) == "function" then
+    try("qlink setvalue", function() q.SetValue(value); end);
+  end
+end
+
+-- The fader's position sets the chosen parameter of the track in that column (fader mode).
 local function handleFader(fader, value)
   local track = trackForFader(fader);
-  if track then track.Volume.value = value / 127; end
+  if not track then return; end
+  local v = value / 127;
+  if faderMode == "volume" then
+    track.Volume.value = v;
+  elseif faderMode == "pan" then
+    try("fader pan", function() track.Pan.value = v; end);
+  elseif faderMode == "send" then
+    try("fader send", function() track["Send" .. sendIndex].value = v; end);
+  elseif faderMode == "device" then
+    setQlinkFader(fader, value);
+  end
+end
+
+-- The 9th fader always drives the master track's volume, like Ableton's master fader (independent
+-- of the fader mode). masterTracks[0] is the main master, the same object shape as a normal track.
+local function handleMasterFader(value)
+  try("master volume", function()
+    local mt = mpc.tracks.masterTracks and mpc.tracks.masterTracks[0];
+    if mt and mt.Volume then mt.Volume.value = value / 127; end
+  end);
 end
 
 -----------------------------------------------------------------------------------------------
@@ -336,7 +501,7 @@ local function page(dir)
   local a = aperture();
   if dir == "left" then a.MoveLeft(1); elseif dir == "right" then a.MoveRight(1);
   elseif dir == "up" then a.MoveUp(1); elseif dir == "down" then a.MoveDown(1); end
-  refreshAll();
+  windowMoved();
 end
 
 local function handlePad(note)
@@ -346,17 +511,60 @@ local function handlePad(note)
   if not shiftHeld then a.TriggerClip(col, row); end   -- shift + pad: select only
 end
 
+-- Shift + Volume/Pan/Send/Device (track buttons 1-4) selects the fader mode. Pressing Send again
+-- (while already in send mode) cycles Send 1->2->3->4.
+local function setFaderMode(idx)
+  local mode = FADER_MODES[idx];
+  if not mode then return; end
+  if mode == "send" and faderMode == "send" then
+    sendIndex = sendIndex % 4 + 1;
+  else
+    faderMode = mode;
+  end
+  log("fader mode: " .. faderMode .. (faderMode == "send" and (" " .. sendIndex) or ""));
+  updateTrackButtons();
+end
+
+-- A plain press of a bottom button applies the active track-button mode to that track's column.
+local function applyTrackButton(col)
+  if trackMode == "select" then
+    aperture().SelectTrack(col);                 -- make it the MPC's current track (unchanged)
+  elseif trackMode == "clipStop" then
+    try("StopClipsOnTrack", function() aperture().StopClipsOnTrack(col); end);  -- best-effort
+  else
+    local _, t = windowTrack(col);
+    if not t then return; end
+    if trackMode == "mute" then
+      try("SetMute", function() t.SetMute(not trackFlag(t, "Mute")); end);
+    elseif trackMode == "solo" then
+      try("SetSolo", function() t.SetSolo(not trackFlag(t, "Solo")); end);
+    elseif trackMode == "recArm" then
+      try("SetRecArm", function() t.SetRecArm(not trackFlag(t, "RecArm")); end);
+    end
+  end
+  if not shiftHeld then updateTrackButtons(); end
+end
+
 local function handleTrackButton(idx)      -- idx 0-7 within the 8 track buttons
   if not shiftHeld then
-    aperture().SelectTrack(idx);           -- plain: make it the MPC's current track
+    applyTrackButton(idx);                 -- plain: apply the active track-button mode
+  elseif idx <= 3 then
+    setFaderMode(idx);                     -- shift + Volume/Pan/Send/Device: pick the fader mode
   elseif CURSOR[idx] then
-    page(CURSOR[idx]);                     -- shift + arrow: move the window by 1
-  end                                      -- shift + track 1-4: nothing
+    page(CURSOR[idx]);                     -- shift + arrow (buttons 5-8): move the window by 1
+  end
 end
 
 local function handleSceneButton(row)
   if shiftHeld then
-    if row == SCENE_STOP_ALL then mpc.clipMatrix.StopAllClips(); end
+    if row == SCENE_STOP_ALL then
+      mpc.clipMatrix.StopAllClips();
+    elseif SCENE_MODE[row] then
+      trackMode = SCENE_MODE[row];          -- shift + Clip Stop/Solo/Mute/Rec Arm/Select
+      log("track mode: " .. trackMode);
+      updateTrackButtons();
+      updateSceneButtons();                 -- reflect the new mode on the scene LEDs (shift held)
+    end
   else
     aperture().TriggerRow(row);
   end
@@ -368,7 +576,7 @@ end
 
 function apcMiniMk2.HandleMIDINoteOn(channel, note, velocity)
   if velocity == 0 then return apcMiniMk2.HandleMIDINoteOff(channel, note, velocity); end
-  if note == shiftNote then shiftHeld = true;
+  if note == shiftNote then shiftHeld = true; updateTrackButtons(); updateSceneButtons();
   elseif note < cols * rows then handlePad(note);
   elseif note >= trackButtonBase and note < trackButtonBase + cols then handleTrackButton(note - trackButtonBase);
   elseif note >= sceneButtonBase and note < sceneButtonBase + rows then handleSceneButton(note - sceneButtonBase);
@@ -385,7 +593,9 @@ function apcMiniMk2.HandleMIDINoteOff(channel, note, velocity)
 end
 
 function apcMiniMk2.HandleMIDICC(channel, cc, value)
-  if cc >= faderCCBase and cc < faderCCBase + cols then handleFader(cc - faderCCBase, value); end
+  if cc >= faderCCBase and cc < faderCCBase + cols then handleFader(cc - faderCCBase, value);
+  elseif cc == masterFaderCC then handleMasterFader(value);
+  end
 end
 
 -- One-shot, shortly after load: the first messages after a USB MIDI port opens can be lost, so
@@ -408,6 +618,7 @@ local function teardown()
   if not loaded then return; end
   loaded = false;
   clearListeners();
+  clearMixerListeners();
   routeSurface(false);
   try("clipMatrixAperture.Hide", function() aperture().Hide(); end);
 end
@@ -446,6 +657,7 @@ function apcMiniMk2.OnLoad()
   routeSurface(true);
 
   registerListeners();
+  registerMixerListeners();
   -- The first real paint happens in HandleTimer, after the white flash. If the timer cannot be
   -- started, paint now instead so the pads still show the clip state.
   if not try("timer.Start", function() apcMiniMk2.timer.Start(settleDelayMs); end) then repaintAll(); end
